@@ -1,0 +1,190 @@
+非对齐ck的步骤
+核心思路:barrie超越data buffer,并对这些data快照
+
+uc同步阶段task不能处理数据
+1.Barrie超车:当上游某一个inputChannel中的Barrie到来后,
+				1.开始uc,不需要等其他inputChannel中的barrier到来,
+				2.也不需要处理当先inputChannel中的数据;而是直接发送到outputChannel的头部,
+2.引用buffer
+				1.只是引用,快照会在异步阶段完成
+3.算子snapshot
+				1.调用算子的snapshotState方法
+4.引用State
+				1.State Backend同步快照		
+
+3,4阶段与ac阶段完全一致,对算子内部进行快照
+
+
+uc Barrie对齐
+				1.需要等待其他inputChannel中的barrier到达
+				2.且Barrie之前的buffer都要快照
+uc异步阶段
+1.算子的state:	将同步阶段算子内部state,写入到
+2.input&output: 将同步阶段引用的所有inputBuffer和outPutBuffer
+3.OtherChannel:	其他InputChannel Barrier之前的buffer
+回报元数据: 		将上面三部分数据写完后,汇报给jm
+
+在进行uc和ac时task不能处理数据,换言之在处理数据时uc Barrie来了也不能响应uc;所以在task处理数据的写入到outputBuffer的过程如果太慢,uc也会超时;
+task处理完数据
+
+利用非对齐ck优化任务被压
+背景:.....
+
+
+
+hudi
+Timeline 是 HUDI 用来管理提交（commit）的抽象，每个 commit 都绑定一个固定时间戳，分散到时间线上。在 Timeline 上，每个 commit 被抽象为一个 HoodieInstant，一个 instant 记录了一次提交 (commit) 的行为、时间戳、和状态。 HUDI 的读写 API 通过 Timeline 的接口可以方便的在 commits 上进行条件筛选，对 history 和 on-going 的 commits 应用各种策略，快速筛选出需要操作的目标 commit。
+
+file group的划分逻辑是按照大小来的
+file siles的划分逻辑是按照instans time来的
+
+mor适合吞吐高,写入行为,写入的时候没有去重过程
+cow适合读没有读取时的compaction动作(异步的)
+
+cow: 每次把新数据和base数据做merge然后再写入一个全量
+一个parquet文件一个 file slide
+新数据来了会在内存中,并且做索引;
+扫描历史数据,可以相同则作merge,
+merge的触发条件是可定义的,默认时按照最新的时间戳来;merge也就是 preCombine
+最后形成新的file silce
+所以
+cow写入或破坏数据的顺序性;
+
+mor
+数据不断追加写入到log(Avro)文件中,没有compaction动作则一直写,除非超过了额定了log文件大小(默认1G)才会切换
+所以不会产生小文件,并且是顺序的
+
+index
+索引是写入过程中非常核心的部分
+写入的时候需要知道数据在拿个file group 和哪个file slice
+
+bloom index能做到partition级别的索引
+global的 index 分为 hbase 和flink state
+
+flink对于没有历史数据的写入行为是
+根据file group的大小来写log文件当log超过1G则新分一个file group来写
+
+flink对于有历史数据的写入行为是
+对于update数据的写入根据索引来判断应该更新哪个filegroup里的fileslice
+对于新数据来说bucketAssigner会先分配写已有的还未写满filegroup,以解决小文件问题
+
+异步压缩
+Async Compaction动作发生在flink写入hudi管道中
+Compaction的行为是有参数控制,时间个commit的次数;
+Compaction触发后会扫描bucket,然后
+以fileslice为单位去planning compaction
+一个fileslice会产生一个compaction task
+多个Compactiontask会组成Compaction plan,发送给真正执行Compaction的task执行
+Compaction完成之后会在各自对应的bucket中生成全量的parquet文件(fileslice)
+
+flink stream read
+cow不支持 流式读取
+不同的instant为了解决小文件问题会写同一个log文件
+flink 流式读取的参数是每个多少秒去读一次,
+读取的过程是flink会监听这段时间内有没有新的instant生成,有的话;
+上一个instan和本次instant中间的新增数据就是本次流式读取的目标数据;
+如果两次instan写了同一个fileslice 那么会通过hoodie_commit_time来过滤它
+并将insert数据发送至下游
+
+
+怎样让flink运行得更快
+1.减少重复计算
+ 	使用视图将重复的逻辑提取出来
+2.减少无效数据的计算
+3.解决数据倾斜的问题
+4.提高任务的吞吐
+5.减少state的访问
+	1.MInibatch减少state的频繁访问,有时间大小参数,表示一个minibatch多长时间
+		相当于有一个buffer,数据会在buffer中以key分组计算;对state的访问次数就变成了key的去重个数
+		同时,也会合并回撤消息,以减少发送给下游的数据量
+		适用场景:
+		1.需要任务容忍延迟;
+		2.访问state是瓶颈
+		3.下游成为瓶颈
+	解决热点key
+	2.local/global
+		会在scan和globalAgg之间加一层 localAgg	;scan和localAgg之间是forward shuffle
+		在localAgg里对MiniBatch的做聚合,把聚合的结果输出到globalAgg做计算;这样就减少了热点key
+		适用场景:
+		1.需要开启Minibatch
+		2.需要agg方法实现merge方法
+		3.数据应该出现清洁,因为localAgg存在额外计算;如果没有倾斜就等于增加了计算过程
+  	count(distinct b) group a 下的热点key问题
+  		partial/Final
+  		会在scan和FinalAgg中间加上一层partialAgg,scan之后的数据会根据参数hash(b)%bucket数到指定的桶中做提前聚合;
+  		然后根据a做shuffle在发送给FinalAgg做聚合
+  		适用场景:
+  		1.distinct中的key存在数据倾斜
+  		2.distinct的Agg函数必须是内置函数
+  		3.建议对大数据集数用,因为有额外开销
+  		但是partial/Final会存在对state的访问开销
+  		使用incremental
+  		等同于Minibatch和partial/Final的组合
+  		需要开启上面所有的参数,等同于将partialAgg的聚合操作提前到了localAgg上从而之存放key减少了state大小
+  		适用场景:distinct操作 state较大时
+  	count(distinct b), count(distinct  case when d>0 then b else null end) group a 
+  		这种操作两个distinct的state会分别存储;可以改写外如下写法
+  		count(distinct b), count(distinct b) filter(when d>0)  group a
+  		这样distinct的state的就可以复用;以减少state的大小
+6.减少state的大小
+	1.双流join上对于state的优化
+		1.join的key中带有pk
+			这种情况下state存放的是 tuple2<Row,Int> 代表这一行,和被关联的次数
+		2.join的input字段上带有pk
+			这种情况下state存放的是 Map<PK,tuple2<Row,Int>> 存放的是map结构,map的key是主键,值是这一行数据和被关联的次数
+		3.没有pk的情况
+			这种情况下state存放的是 Map<Row,tuple2<Int,Int>> 存放的也是map结构,但是map的key为整行数据,值为这行数据出现的数据和被关联的次数
+		后面两者虽然都是map但是对于state的访问效率不同;
+		所以在join的时候最后是把pk定义出来,并且join字段包含pk,以减少state的大小个对提高对state的访问速度
+	2.在join之前把无效数据去掉
+	3.将regular join改写为 look up join
+		look up join 没有状态
+		纬表侧没法出发计算
+	4.将regular join改写为 intervel join
+		state只存放 该区间的数据
+	5.将regular join改写为 window join
+		state只存放 该窗口的数据
+	6.将regular join改写为 temporal join
+		state只存放 某个版本的数据,历史数据会被清理	
+
+look up join的优化
+	1.通过hint 可以改为异步操作	
+	2.通过hint 可以控制异步查询维表返回的数据是 有序的还是无序的;
+		无序可以减少排序过程提高效率
+	3.Cache
+	  可以选择 look up 的case选项,有以下三种
+	  full cache:
+	  	全量cashe,可以配置多久去reload
+	  partial cache:
+	  	部分cache,可以配置cache的行数,以及cache失效的时间,缓存失效算法lru
+	  no cache:
+	  	没有cache
+
+
+	  	需不需要吧外包经验去掉 
+	  	厦门的工作经历需不需要去掉
+	  	面试到什么程度
+	  	采集项目是否需要去掉
+
+	  	格式要改一下md
+	  	1.项目:  背景,	指标定量;  怎么发现
+	  		hudi 项目 1:为什么用bucket index ;大表的写入比较慢,亿级别的表写入一两个小时;该用bucket index 半个小时;原理:根据N个分桶数产生N个file文件夹(00000001这种),一个文件夹对应一个file group,分桶键必须在主键字段里;使用分桶列join能减少一次shuffle操作
+	  				 2.sp的梳理 ;最底层的表考虑作为 驱动表(最好的话驱动表是只有一张),多个内连接都走流join的话 会使得结果达不到预期,如果在加上几个group by 的嵌套; 定位问题的成本,解释问题的成本很高
+	  				 3.一次写入,没有用bulk insert (因为不去重,需要下游去重;如果使用,在继续写增量数据是需要打开index bootstrap,需要加载历史数据到flink state中;这个过程无法ck;并且有输入数据触发,需要悲歌分区至少有一条数据;直到第一个ck完成表示index bootstrap完成;重启任务,设置为false;),非对齐ck治标不治本;能快速解决问题;但是持久化道rocksdb的数据也会变多;恢复也会变慢;最后是定位到hudi的bucket assginer并行度不够;
+
+	  				 4.非主键字段look up join hbase ;首先只不是一个好的解决问题的办法,只能在特定的时候使用; 总的来说就是让join 走get 不走scan; 可以走自定义look up source的方式,网上有实现;
+	  				 5.
+
+	  		高斯项目   1:合适的分布列,倾斜率不超过百分之10;下游只能查询接口视图		 
+
+	  	2.框架:
+	  	3.sql刷一下
+
+
+目前AQE主要有三大特性：
+自动分区合并：在 Shuffle 过后，Reduce Task 数据分布参差不齐，AQE 将自动合并过小的数据分区。
+Join 策略调整：如果某张表在过滤之后，尺寸小于广播变量阈值，这张表参与的数据关联就会从 Shuffle Sort Merge Join 降级（Demote）为执行效率更高的 Broadcast Hash Join。
+自动倾斜处理：结合配置项，AQE 自动拆分 Reduce 阶段过大的数据分区，降低单个 Reduce Task 的工作负载。
+
+
+
