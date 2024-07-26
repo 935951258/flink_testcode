@@ -186,5 +186,6 @@ look up join的优化
 Join 策略调整：如果某张表在过滤之后，尺寸小于广播变量阈值，这张表参与的数据关联就会从 Shuffle Sort Merge Join 降级（Demote）为执行效率更高的 Broadcast Hash Join。
 自动倾斜处理：结合配置项，AQE 自动拆分 Reduce 阶段过大的数据分区，降低单个 Reduce Task 的工作负载。
 
+20240116-20240802工作内容
 
 
