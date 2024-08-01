@@ -200,3 +200,11 @@ sql 模板 freeMarker格式 导入  MariaDB TiDB
 主要表  企业基础信息表 专利企业数据表 
 
 业务 : ，融资动态检测，异动监控热门关键词和案例等；
+
+1.app层sql开发
+2.导入任务使用sqoop导入
+3.调度任务,wtss(azkaban)
+4.es查询任务
+5.tidb sql模版
+
+指标有哪些,怎么做的?  业务逻辑?
